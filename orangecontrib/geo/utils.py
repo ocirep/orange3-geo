@@ -1,4 +1,9 @@
+from concurrent.futures import Future
+from functools import wraps
 from itertools import chain
+from threading import Lock
+from types import SimpleNamespace
+from typing import Callable, TypeVar
 
 import numpy as np
 
@@ -6,8 +11,10 @@ from Orange.data import Table
 from Orange.data.domain import filter_visible
 
 
-LATITUDE_NAMES = ('latitude', 'lat')
-LONGITUDE_NAMES = ('longitude', 'lng', 'long', 'lon')
+T = TypeVar("T")
+
+LATITUDE_NAMES = tuple('latitude, lat'.split(", "))
+LONGITUDE_NAMES = tuple('longitude, lng, long, lon'.split(", "))
 
 
 def find_lat_lon(data, filter_hidden=False):
@@ -49,7 +56,7 @@ def find_lat_lon(data, filter_hidden=False):
     def max_in_col(attr):
         if not data:
             return 0
-        return np.nanmax(np.abs(data.get_column_view(attr)[0].astype(float)))
+        return np.nanmax(np.abs(data.get_column(attr).astype(float)))
 
     if len(cont_vars) == 2:
         if lat_attr is not None:
@@ -66,3 +73,36 @@ def find_lat_lon(data, filter_hidden=False):
         lat_attr = lon_attr = cont_vars[0]
 
     return lat_attr, lon_attr
+
+
+def once(func: Callable[[], T]) -> Callable[[], T]:
+    """
+    Return a function that will be called only once, and it's result cached.
+
+    If an exception occurs the exceptions is reraised on every invocation.
+    """
+    # NOTE: Not fork safe
+    state = SimpleNamespace(
+        lock=Lock(),
+        result=None,
+    )
+
+    @wraps(func)
+    def wrapped():
+        if state.result is not None:
+            return state.result.result()
+        else:
+            with state.lock:
+                if state.result is not None:
+                    return state.result.result
+                else:
+                    f = state.result = Future()
+                    f.set_running_or_notify_cancel()
+                    try:
+                        result = func()
+                    except BaseException as e:
+                        f.set_exception(e)
+                    else:
+                        f.set_result(result)
+                    return state.result.result()
+    return wrapped

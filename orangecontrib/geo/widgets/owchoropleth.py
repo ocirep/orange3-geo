@@ -1,13 +1,13 @@
 import sys
 import itertools
 from xml.sax.saxutils import escape
-from typing import List, NamedTuple, Optional, Union, Callable
+from typing import List, NamedTuple, Optional, Union, Callable, Tuple
 from math import floor, log10
 from functools import reduce
 
 from AnyQt.QtCore import Qt, QObject, QSize, QRectF, pyqtSignal as Signal, \
     QPointF
-from AnyQt.QtGui import QPen, QBrush, QColor, QPolygonF, QPainter, QStaticText
+from AnyQt.QtGui import QPen, QBrush, QColor, QPolygonF, QPainter, QStaticText, QPalette
 from AnyQt.QtWidgets import QApplication, QToolTip, QGraphicsTextItem, \
     QGraphicsRectItem
 
@@ -19,7 +19,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from Orange.data import Table, Domain, ContinuousVariable, DiscreteVariable
+from Orange.data import Table, Domain, ContinuousVariable, DiscreteVariable, \
+    TimeVariable
 from Orange.data.util import array_equal
 from Orange.data.sql.table import SqlTable
 from Orange.misc.cache import memoize_method
@@ -206,7 +207,7 @@ class OWChoroplethPlotGraph(gui.OWComponent, QObject):
 
         self.choropleth_items = []  # type: List[ChoroplethItem]
 
-        self.n_ids = 0
+        self.id_to_index = {}
         self.selection = None  # np.ndarray
 
         self.palette = None
@@ -216,6 +217,10 @@ class OWChoroplethPlotGraph(gui.OWComponent, QObject):
         self._tooltip_delegate = HelpEventDelegate(self.help_event)
         self.plot_widget.scene().installEventFilter(self._tooltip_delegate)
 
+    @property
+    def n_ids(self):
+        return len(self.id_to_index)
+
     def _create_legend(self, anchor):
         legend = LegendItem()
         legend.setParentItem(self.plot_widget.getViewBox())
@@ -224,26 +229,31 @@ class OWChoroplethPlotGraph(gui.OWComponent, QObject):
 
     def _create_drag_tooltip(self, scene):
         tip_parts = [
-            (Qt.ShiftModifier, "Shift: Add group"),
-            (Qt.ShiftModifier + Qt.ControlModifier,
-             "Shift-{}: Append to group".
+            (Qt.ControlModifier,
+             "{}: Append to group".
              format("Cmd" if sys.platform == "darwin" else "Ctrl")),
+            (Qt.ShiftModifier, "Shift: Add group"),
             (Qt.AltModifier, "Alt: Remove")
         ]
-        all_parts = ", ".join(part for _, part in tip_parts)
+        all_parts = "<center>" + \
+                    ", ".join(part for _, part in tip_parts) + \
+                    "</center>"
         self.tiptexts = {
-            int(modifier): all_parts.replace(part, "<b>{}</b>".format(part))
+            modifier: all_parts.replace(part, "<b>{}</b>".format(part))
             for modifier, part in tip_parts
         }
-        self.tiptexts[0] = all_parts
+        self.tiptexts[Qt.NoModifier] = all_parts
 
         self.tip_textitem = text = QGraphicsTextItem()
         # Set to the longest text
-        text.setHtml(self.tiptexts[Qt.ShiftModifier + Qt.ControlModifier])
+        text.setHtml(self.tiptexts[Qt.ControlModifier])
         text.setPos(4, 2)
         r = text.boundingRect()
+        text.setTextWidth(r.width())
         rect = QGraphicsRectItem(0, 0, r.width() + 8, r.height() + 4)
-        rect.setBrush(QColor(224, 224, 224, 212))
+        color = self.plot_widget.palette().color(QPalette.Disabled, QPalette.Window)
+        color.setAlpha(212)
+        rect.setBrush(color)
         rect.setPen(QPen(Qt.NoPen))
         self.update_tooltip()
 
@@ -251,8 +261,13 @@ class OWChoroplethPlotGraph(gui.OWComponent, QObject):
         scene.drag_tooltip.hide()
 
     def update_tooltip(self, modifiers=Qt.NoModifier):
-        modifiers &= Qt.ShiftModifier + Qt.ControlModifier + Qt.AltModifier
-        text = self.tiptexts.get(int(modifiers), self.tiptexts[0])
+        text = self.tiptexts[Qt.NoModifier]
+        for mod in [Qt.ControlModifier,
+                    Qt.ShiftModifier,
+                    Qt.AltModifier]:
+            if modifiers & mod:
+                text = self.tiptexts.get(mod)
+                break
         self.tip_textitem.setHtml(text)
 
     def clear(self):
@@ -260,7 +275,7 @@ class OWChoroplethPlotGraph(gui.OWComponent, QObject):
         self.color_legend.clear()
         self.update_legend_visibility()
         self.choropleth_items = []
-        self.n_ids = 0
+        self.id_to_index = {}
         self.selection = None
 
     def reset_graph(self):
@@ -282,7 +297,8 @@ class OWChoroplethPlotGraph(gui.OWComponent, QObject):
             self.choropleth_items.append(choropleth_item)
 
         if self.choropleth_items:
-            self.n_ids = len(self.master.region_ids)
+            self.id_to_index = {
+                id_: cnt for cnt, id_ in enumerate(self.master.region_ids)}
 
     def update_colors(self):
         """Update agg_value and inner color of existing polygons."""
@@ -402,13 +418,50 @@ class OWChoroplethPlotGraph(gui.OWComponent, QObject):
         self.plot_widget.getViewBox().setMouseMode(
             self.plot_widget.getViewBox().RectMode)
 
+    def set_selection_from_ids(self, sel_ids):
+        """
+        Select regions with given ids.
+
+        Graph stores ids in array, where each element stores an index of
+        selection group for the corresponding region, while the widget
+        stores selection as tuples with region ids and groups.
+
+        This method receives widget-like selection and stores it in
+        graph's array.
+
+        Args:
+            ids (dict of str to int): selection, as stored by widget
+        """
+        self.selection = np.zeros(self.n_ids, dtype=np.uint8)
+        if not sel_ids:
+            return
+        by_ids = np.array(
+            [[self.id_to_index[id_], grp]
+             for id_, grp in sel_ids if id_ in self.id_to_index])
+        if by_ids.size:
+            idx, grp = by_ids.T
+            self.selection[idx] = grp
+
+    def selected_ids(self):
+        """
+        Return ids of selected regions. See `set_selection_from_ids`.
+
+        Returns:
+            ids (dict of str to int): selection, as stored by widget
+        """
+
+        if self.selection is None:
+            return []
+        ids = self.master.region_ids
+        sel = np.flatnonzero(self.selection)
+        return list(zip(ids[sel], self.selection[sel]))
+
     def select_by_id(self, region_id):
         """
         This is called by a `ChoroplethItem` on click.
         The selection is then based on the corresponding region.
         """
-        indices = np.where(self.master.region_ids == region_id)[0]
-        self.select_by_indices(indices)
+        self.select_by_indices(self.id_to_index[region_id])
 
     def select_by_rectangle(self, rect: QRectF):
         """
@@ -418,7 +471,7 @@ class OWChoroplethPlotGraph(gui.OWComponent, QObject):
         indices = set()
         for ci in self.choropleth_items:
             if ci.intersects(poly_rect):
-                indices.add(np.where(self.master.region_ids == ci.region.id)[0][0])
+                indices.add(self.id_to_index[ci.region.id])
         if indices:
             self.select_by_indices(np.array(list(indices)))
 
@@ -432,12 +485,12 @@ class OWChoroplethPlotGraph(gui.OWComponent, QObject):
         if self.selection is None:
             self.selection = np.zeros(self.n_ids, dtype=np.uint8)
         keys = QApplication.keyboardModifiers()
-        if keys & Qt.AltModifier:
-            self.selection_remove(indices)
-        elif keys & Qt.ShiftModifier and keys & Qt.ControlModifier:
+        if keys & Qt.ControlModifier:
             self.selection_append(indices)
         elif keys & Qt.ShiftModifier:
             self.selection_new_group(indices)
+        elif keys & Qt.AltModifier:
+            self.selection_remove(indices)
         else:
             self.selection_select(indices)
 
@@ -536,20 +589,26 @@ AggDesc = NamedTuple("AggDesc", [("transform", Union[str, Callable]),
                                  ("disc", bool), ("time", bool)])
 
 AGG_FUNCS = {
-    'Count': AggDesc("size", True, True),
-    'Count defined': AggDesc("count", True, True),
+    'Instance Count': AggDesc("size", True, True),
+    'Defined Values Count': AggDesc("count", True, True),
     'Sum': AggDesc("sum", False, False),
     'Mean': AggDesc("mean", False, True),
     'Median': AggDesc("median", False, True),
-    'Mode': AggDesc(lambda x: stats.mode(x, nan_policy='omit').mode[0],
+    'Mode': AggDesc(lambda x: stats.mode(x, nan_policy='omit', keepdims=True).mode[0],
                     True, True),
     'Maximal': AggDesc("max", False, True),
     'Minimal': AggDesc("min", False, True),
     'Std.': AggDesc("std", False, False)
 }
 
-DEFAULT_AGG_FUNC = list(AGG_FUNCS)[0]
+DEFAULT_AGG_FUNCS = {
+    DiscreteVariable: "Mode",
+    ContinuousVariable: "Mean",
+    TimeVariable: "Median"
+}
 
+COUNT_AGGS = list(AGG_FUNCS)[:2]
+DEFAULT_AGG_FUNC = COUNT_AGGS[0]
 
 class OWChoropleth(OWWidget):
     """
@@ -572,7 +631,7 @@ class OWChoropleth(OWWidget):
 
     settings_version = 2
     settingsHandler = DomainContextHandler()
-    selection = Setting(None, schema_only=True)
+    selection: Optional[List[Tuple[str, int]]] = Setting(None, schema_only=True)
     auto_commit = Setting(True)
 
     attr_lat = ContextSetting(None)
@@ -585,7 +644,7 @@ class OWChoropleth(OWWidget):
 
     GRAPH_CLASS = OWChoroplethPlotMapGraph
     graph = SettingProvider(OWChoroplethPlotMapGraph)
-    graph_name = "graph.plot_widget.plotItem"
+    graph_name = "graph.plot_widget.plotItem"  # pg.GraphicsItem  (pg.PlotItem)
 
     input_changed = Signal(object)
     output_changed = Signal(object)
@@ -653,7 +712,7 @@ class OWChoropleth(OWWidget):
                      **options, searchable=True)
 
         self.agg_func_combo = gui.comboBox(agg_box, self, 'agg_func',
-                                           label='Agg.:',
+                                           label='Show:',
                                            items=[DEFAULT_AGG_FUNC],
                                            callback=self.graph.update_colors,
                                            **options)
@@ -705,7 +764,6 @@ class OWChoropleth(OWWidget):
         self.data = data
         self.Warning.no_region.clear()
         self.Error.no_lat_lon_vars.clear()
-        self.agg_func = DEFAULT_AGG_FUNC
         self.check_data()
         self.init_attr_values()
         self.openContext(self.data)
@@ -737,11 +795,17 @@ class OWChoropleth(OWWidget):
         domain = self.data.domain if self.data is not None else None
         self.lat_lon_model.set_domain(domain)
         self.agg_attr_model.set_domain(domain)
-        self.agg_attr = domain.class_var if domain is not None else None
+        if domain is not None and domain.class_var:
+            self.agg_attr = domain.class_var
+        elif self.agg_attr_model:
+            self.agg_attr = self.agg_attr_model[0]
+        else:
+            self.agg_attr = None
         self.attr_lat, self.attr_lon = lat, lon
 
     def update_agg(self):
-        current_agg = self.agg_func
+        # Store previous aggregation to keep it, unless it was the only choice
+        current_agg = self.agg_func_combo.count() > 1 and self.agg_func
         self.agg_func_combo.clear()
 
         if self.agg_attr is not None:
@@ -758,7 +822,8 @@ class OWChoropleth(OWWidget):
         if current_agg in new_aggs:
             self.agg_func = current_agg
         else:
-            self.agg_func = DEFAULT_AGG_FUNC
+            self.agg_func = DEFAULT_AGG_FUNCS.get(type(self.agg_attr),
+                                                  DEFAULT_AGG_FUNC)
 
         self.graph.update_colors()
 
@@ -769,17 +834,21 @@ class OWChoropleth(OWWidget):
 
     def apply_selection(self):
         if self.data is not None and self.selection is not None:
-            index_group = np.array(self.selection).T
-            selection = np.zeros(self.graph.n_ids, dtype=np.uint8)
-            selection[index_group[0]] = index_group[1]
-            self.graph.selection = selection
+            # on-the-spot migration of a context-like setting
+            if self.selection and isinstance(self.selection[0][0], int):
+                self.selection = [
+                    (self.region_ids[id_], grp) for id_, grp in self.selection
+                    if id_ < len(self.region_ids)
+                ]
+            self.graph.set_selection_from_ids(self.selection)
+            # Retrieve selection back from graph
+            # to remove any regions that no longer exist in the new data
+            self.selection = self.graph.selected_ids()
             self.graph.update_selection_colors()
 
     def selection_changed(self):
-        sel = None if self.data and isinstance(self.data, SqlTable) \
-            else self.graph.selection
-        self.selection = [(i, x) for i, x in enumerate(sel) if x] \
-            if sel is not None else None
+        self.selection = None if self.data and isinstance(self.data, SqlTable) \
+            else self.graph.selected_ids()
         self.commit()
 
     def commit(self):
@@ -791,9 +860,9 @@ class OWChoropleth(OWWidget):
         if data:
             group_sel = np.zeros(len(data), dtype=int)
 
-            if len(graph_sel):
+            if self.selection:
                 # we get selection by region ids so we have to map it to points
-                for id, s in zip(self.region_ids, graph_sel):
+                for id, s in self.selection:
                     if s == 0:
                         continue
                     id_indices = np.where(self.data_ids == id)[0]
@@ -818,22 +887,21 @@ class OWChoropleth(OWWidget):
         if self.is_mode():
             return
 
-        if self.is_time():
-            self.binnings = time_binnings(self.agg_data,
-                                          min_bins=3, max_bins=15)
+        if np.all(np.isnan(self.agg_data)):
+            self.binning = []
         else:
-            self.binnings = decimal_binnings(self.agg_data,
-                                             min_bins=3, max_bins=15)
+            binner = time_binnings if self.is_time() else decimal_binnings
+            self.binnings = binner(self.agg_data, min_bins=3, max_bins=15)
 
-        max_bins = len(self.binnings) - 1
-        self.controls.binning_index.setMaximum(max_bins)
-        self.binning_index = min(max_bins, self.binning_index)
+        max_index = len(self.binnings) - 1
+        self.controls.binning_index.setMaximum(max(1, max_index))
+        self.binning_index = min(max_index, self.binning_index)
 
     def get_binning(self) -> BinDefinition:
         return self.binnings[self.binning_index]
 
     def get_palette(self):
-        if self.agg_func in ('Count', 'Count defined'):
+        if self.agg_func in COUNT_AGGS:
             return DefaultContinuousPalette
         elif self.is_mode():
             return LimitedDiscretePalette(MAX_COLORS)
@@ -885,7 +953,7 @@ class OWChoropleth(OWWidget):
     def is_time(self):
         return self.agg_attr is not None and \
                self.agg_attr.is_time and \
-               self.agg_func not in ('Count', 'Count defined')
+               self.agg_func not in COUNT_AGGS
 
     @memoize_method(3)
     def get_regions(self, lat_attr, lon_attr, admin):
@@ -896,8 +964,7 @@ class OWChoropleth(OWWidget):
             dict of region ids matched to their additional info,
             dict of region ids matched to their polygon
         """
-        latlon = np.c_[self.data.get_column_view(lat_attr)[0],
-                       self.data.get_column_view(lon_attr)[0]]
+        latlon = np.c_[self.data.get_column(lat_attr), self.data.get_column(lon_attr)]
         region_info = latlon2region(latlon, admin)
         ids = np.array([region.get('_id') for region in region_info])
         region_info = {info.get('_id'): info for info in region_info}
@@ -919,7 +986,7 @@ class OWChoropleth(OWWidget):
             Series of aggregated values
         """
         if attr is not None:
-            data = self.data.get_column_view(attr)[0]
+            data = self.data.get_column(attr)
         else:
             data = np.ones(len(self.data))
 
@@ -947,7 +1014,7 @@ class OWChoropleth(OWWidget):
         return self.agg_data
 
     def format_agg_val(self, value):
-        if self.agg_func in ('Count', 'Count defined'):
+        if self.agg_func in COUNT_AGGS:
             return f"{value:d}"
         else:
             return self.agg_attr.repr_val(value)
