@@ -4,7 +4,7 @@ from os import path
 from setuptools import setup, find_packages
 
 
-VERSION = "0.4.0"
+VERSION = "0.4.2"
 
 README_FILE = path.join(path.dirname(__file__), 'README.pypi')
 LONG_DESCRIPTION = open(README_FILE).read()
@@ -47,7 +47,7 @@ if __name__ == '__main__':
         packages=find_packages(),
         include_package_data=True,
         install_requires=[
-            'Orange3>=3.31.0',
+            'Orange3>=3.34.0',
             'scikit-learn',
             'pandas',
             'scipy>=0.17',
